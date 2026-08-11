@@ -5,6 +5,8 @@ import static java.util.Arrays.asList;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -28,6 +30,38 @@ public class WebSecurityConfig {
 
   public WebSecurityConfig(JwtTokenFilter jwtTokenFilter) {
     this.jwtTokenFilter = jwtTokenFilter;
+  }
+
+  @Value("${management.server.port:-1}")
+  private int managementPort;
+
+  /**
+   * Actuator, on its own connector, without authentication.
+   *
+   * <p>WHY THIS EXISTS: the chain below ends in {@code anyRequest().authenticated()}, and a single
+   * SecurityFilterChain covers every connector — so Actuator on the management port answered 401.
+   * Kubernetes reads that as a failed probe, so the container started cleanly, served nothing, and
+   * was killed 150 seconds later by the startup probe. The event said only "HTTP probe failed with
+   * statuscode: 401", which names neither this class nor the port.
+   *
+   * <p>WHY permitAll IS SAFE HERE, AND WOULD NOT BE ON 8080: this matches on the management port
+   * only, which no Ingress routes. It is reachable from inside the cluster — the kubelet for
+   * probes, Prometheus for scraping — and from nowhere else. That separation is the entire reason
+   * management.server.port is set; on a shared port these endpoints would sit under /api, which
+   * CloudFront publishes to the internet.
+   *
+   * <p>Matching on the port rather than on EndpointRequest.toAnyEndpoint() is deliberate: it
+   * depends on nothing but the servlet API, so it does not move when Actuator's packages are
+   * reorganised between Spring Boot majors.
+   */
+  @Bean
+  @Order(Ordered.HIGHEST_PRECEDENCE)
+  public SecurityFilterChain actuatorFilterChain(HttpSecurity http) throws Exception {
+    http.securityMatcher(request -> request.getLocalPort() == managementPort)
+        .csrf(csrf -> csrf.disable())
+        .authorizeHttpRequests(auth -> auth.anyRequest().permitAll());
+
+    return http.build();
   }
 
   @Bean
