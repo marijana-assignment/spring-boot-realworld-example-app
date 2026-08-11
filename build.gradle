@@ -23,6 +23,20 @@ dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-security'
 	implementation 'org.springframework.boot:spring-boot-starter-validation'
 	implementation 'org.springframework.boot:spring-boot-starter-web'
+
+	// Actuator + Micrometer. NOT optional extras here — the deployment manifests
+	// in the platform repository depend on both:
+	//   * readiness and liveness probes hit /actuator/health/{readiness,liveness}
+	//   * the ALB target-group health check hits the readiness path
+	//   * a ServiceMonitor scrapes /actuator/prometheus
+	// Without these the pods never become Ready and the target group never turns
+	// healthy, which presents as a 503 at the edge and says nothing about a
+	// missing dependency.
+	//
+	// No version on either: both are managed by the Spring Boot BOM, unlike the
+	// refreshVersions-managed `:_` entries below.
+	implementation 'org.springframework.boot:spring-boot-starter-actuator'
+	runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
 	implementation 'org.flywaydb:flyway-database-postgresql'
 	implementation 'org.springdoc:springdoc-openapi-starter-common:_'
 	implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:_'
