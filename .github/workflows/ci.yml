@@ -1,0 +1,242 @@
+---
+name: build, scan, deploy
+
+# The application pipeline. It never talks to Kubernetes.
+#
+# The last step commits a new image tag into the platform repository, and Argo
+# CD — running inside the cluster — notices and syncs. That commit IS the
+# deploy: the audit trail is `git log` and a rollback is `git revert`. No
+# kubeconfig exists in this workflow, and no AWS credential outlives the job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# WITHOUT id-token: write NO OIDC TOKEN IS MINTED AT ALL, and
+# configure-aws-credentials fails with "Could not assume role" — a message that
+# says nothing about permissions.
+permissions:
+  id-token: write
+  contents: read
+  security-events: write # Trivy SARIF upload to code scanning
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 344530147000.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: incode-takehome/realworld-api
+  PLATFORM_REPO: marijana-assignment/platform
+  KUSTOMIZE_IMAGE_NAME: conduit-api
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Tests run against a real PostgreSQL, not an in-memory substitute. The
+  # application uses Flyway migrations and Postgres-specific SQL; H2 would pass
+  # tests that production would fail.
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Java 21 matches sourceCompatibility in build.gradle. The runtime image
+      # is a JRE 26, which runs 21 bytecode — building against the lower of the
+      # two is what keeps that guarantee honest.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: gradlew is executable
+        run: chmod +x ./gradlew
+
+      - name: test
+        run: ./gradlew test --no-daemon
+        env:
+          # Names come from src/main/resources/application.properties, which
+          # builds the JDBC URL out of these three rather than reading
+          # SPRING_DATASOURCE_URL. Do not "modernise" them without changing the
+          # properties file — and the Kubernetes ConfigMap alongside it.
+          DB_HOST: localhost
+          DB_PORT: '5432'
+          DB_DATABASE: test
+          DB_USERNAME: test
+          DB_PASSWORD: test
+          # Test-only value, and it is in the repository already (.env.testing).
+          # The production secret comes from Secrets Manager via External
+          # Secrets Operator and never appears here.
+          JWT_SECRET_KEY: MDIyZGQwMDdjNDA3ZDQwYTc4MGYyNjdkZjFkZTJkMzRhMDhmMTNkN2QyMWY5ZjMxMTYwZjM5ZDI1YjE5ZjhiYQ==
+
+  # ---------------------------------------------------------------------------
+  # Build, scan, push. Only on main — a pull request stops after tests, because
+  # an image tagged with a commit that may never merge is landfill in ECR.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: gradlew is executable
+        run: chmod +x ./gradlew
+
+      # The Dockerfile does not build anything — it COPYs
+      # build/libs/realworld-0.0.1-SNAPSHOT.jar. The jar has to exist first.
+      - name: build jar
+        run: ./gradlew bootJar --no-daemon -x test
+
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      # OIDC. This role may do exactly one thing: push to the `api` ECR
+      # repository. It cannot read state, cannot touch the cluster, and cannot
+      # push to the `web` repository. Its trust condition is StringEquals on the
+      # full sub, pinned to refs/heads/main in this repository alone.
+      - name: assume ECR push role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-ecr-api-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      # ⚠️ SINGLE-ARCH amd64, AND THAT IS A CONSTRAINT, NOT A DEFAULT.
+      #
+      # This originally built arm64 on a native ubuntu-24.04-arm runner, because
+      # the nodes were Graviton. They are not: an org SCP denies every Graviton
+      # instance type, so the node group runs t3.medium and the manifests pin
+      # kubernetes.io/arch: amd64.
+      #
+      # If this ever produces an arm64 image again, the pod does not crash — it
+      # sits Pending forever, and the event never mentions architecture. Build
+      # platform and nodeSelector have to move together.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Scans the image that was just pushed, not a local one — what runs is
+      # what gets scanned. ECR tag immutability means this tag can never be
+      # repointed at different content afterwards.
+      - name: trivy scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: upload scan to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+      # Fails the job on CRITICAL/HIGH — but only AFTER the SARIF is uploaded,
+      # so a failing scan still leaves a readable report rather than just a red
+      # cross.
+      - name: fail on critical or high
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # ---------------------------------------------------------------------------
+  # The deploy. One commit into another repository, and nothing else.
+  # ---------------------------------------------------------------------------
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+
+    steps:
+      # ⚠️ THIS TOKEN IS THE ONE LONG-LIVED CREDENTIAL IN THE PIPELINE.
+      #
+      # GITHUB_TOKEN is scoped to this repository and cannot write to another
+      # one, so a cross-repo commit needs its own credential: a fine-grained PAT
+      # with contents:write on the platform repository only. It is recorded in
+      # the platform repo's KNOWN-GAPS.md rather than left to be discovered.
+      #
+      # The alternative — Argo CD Image Updater in argocd write-back mode — was
+      # rejected: it mutates the live Application object, so the running tag is
+      # one `git log` never recorded. That breaks both auditability and
+      # revert-based rollback.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          ref: main
+
+      - uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: '5.4.3'
+
+      # Only the dev overlay. Promotion to production is a separate, deliberate
+      # commit — an image reaching production because it merged to main here
+      # would be exactly the accident this repository is structured to avoid.
+      - name: set image tag
+        working-directory: gitops/env/dev/apps
+        run: |
+          kustomize edit set image \
+            ${{ env.KUSTOMIZE_IMAGE_NAME }}=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ needs.build.outputs.image_tag }}
+
+      - name: commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "image tag unchanged — nothing to commit"
+            exit 0
+          fi
+
+          git add gitops/env/dev/apps/kustomization.yaml
+          git commit -m "deploy(dev): conduit-api ${{ needs.build.outputs.image_tag }}
+
+          From ${{ github.repository }}@${{ github.sha }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git push
