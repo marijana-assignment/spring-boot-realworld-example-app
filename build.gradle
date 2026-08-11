@@ -14,6 +14,22 @@ java {
 	sourceCompatibility = '21'
 }
 
+// Overrides the version io.spring.dependency-management pins from the Spring
+// Boot BOM. Not a preference — the CI supply-chain gate refused to ship without
+// it:
+//
+//   org.postgresql:postgresql  CVE-2026-54291  HIGH  installed 42.7.11, fixed 42.7.12
+//
+// A property override rather than a version on the dependency line, because the
+// driver also arrives transitively; pinning only the direct declaration would
+// leave the vulnerable copy on the classpath and the scan would still fail.
+//
+// 42.7.13 rather than the minimum 42.7.12: it is the newest patch in the same
+// line, so it costs nothing and avoids a second bump for the next advisory in
+// this driver. Revisit on the next Spring Boot upgrade — a stale override that
+// holds a dependency BELOW what the BOM manages is its own kind of debt.
+ext['postgresql.version'] = '42.7.13'
+
 repositories {
 	mavenCentral()
 }
